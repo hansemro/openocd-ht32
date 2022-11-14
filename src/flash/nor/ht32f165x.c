@@ -16,6 +16,7 @@
 #define FMC_REG_WRDR        0x04
 #define FMC_REG_OCMR        0x0C
 #define FMC_REG_OPCR        0x10
+#define FMC_REG_PPSR        0x20
 #define FMC_REG_CPSR        0x30
 
 #define FMC_CMD_WORD_PROG   0x4
@@ -299,9 +300,9 @@ static int ht32f165x_protect_check(struct flash_bank *bank)
 
     // Read page protection
     for(int i = 0; i < 4; ++i)
-        target_read_u32(target, OPT_BYTE + (i << 2), ob_pp + i);
+        target_read_u32(target, FMC_REG_BASE + FMC_REG_PPSR + (i << 2), ob_pp + i);
     // Read protection config
-    target_read_u32(target, OPT_BYTE + 0x10, &ob_cp);
+    target_read_u32(target, FMC_REG_BASE + FMC_REG_CPSR, &ob_cp);
 
     LOG_INFO("ht32f165x opt byte: %04x %04x %04x %04x %04x", ob_pp[0], ob_pp[1], ob_pp[2], ob_pp[3], ob_cp);
 
