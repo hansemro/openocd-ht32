@@ -16,6 +16,7 @@
 #define FMC_REG_WRDR        0x04
 #define FMC_REG_OCMR        0x0C
 #define FMC_REG_OPCR        0x10
+#define FMC_REG_CPSR        0x30
 
 #define FMC_CMD_WORD_PROG   0x4
 #define FMC_CMD_PAGE_ERASE  0x8
@@ -105,9 +106,117 @@ static int ht32f165x_erase(struct flash_bank *bank, unsigned int first, unsigned
     return ERROR_OK;
 }
 
+static int ht32f165x_program_word(struct flash_bank *bank, uint32_t addr, uint32_t value)
+{
+    struct target *target = bank->target;
+    int retval;
+    LOG_INFO("ht32f165x programming word 0x%04x @ 0x%04x", value, addr);
+    retval = target_write_u32(target, FMC_REG_BASE + FMC_REG_TADR, addr);
+    if (retval != ERROR_OK)
+        return retval;
+    retval = target_write_u32(target, FMC_REG_BASE + FMC_REG_WRDR, value);
+    if (retval != ERROR_OK)
+        return retval;
+    retval = target_write_u32(target, FMC_REG_BASE + FMC_REG_OCMR, FMC_CMD_WORD_PROG);
+    if (retval != ERROR_OK)
+        return retval;
+    retval = target_write_u32(target, FMC_REG_BASE + FMC_REG_OPCR, FMC_COMMIT);
+    if (retval != ERROR_OK)
+        return retval;
+
+    // wait
+    retval = ht32f165x_wait_status_busy(bank, FLASH_ERASE_TIMEOUT);
+    if (retval != ERROR_OK)
+        return retval;
+    return ERROR_OK;
+}
+
 static int ht32f165x_protect(struct flash_bank *bank, int set, unsigned int first, unsigned int last)
 {
-    return ERROR_FLASH_OPER_UNSUPPORTED;
+    struct target *target = bank->target;
+    uint32_t security;
+    uint32_t ob_pp[4];
+    uint32_t ob_cp;
+    uint32_t ob_ck;
+
+    if (target->state != TARGET_HALTED) {
+        LOG_ERROR("Target not halted");
+        return ERROR_TARGET_NOT_HALTED;
+    }
+
+    // skip operation if security is already enabled
+    // flash security cannot be unset once set and can only
+    // be cleared by mass erase
+    target_read_u32(target, FMC_REG_BASE + FMC_REG_CPSR, &security);
+    if ((security & 1) == 0 || set == 0)
+        return ERROR_FLASH_OPER_UNSUPPORTED;
+
+    // erase option byte page
+    int retval = target_write_u32(target, FMC_REG_BASE + FMC_REG_TADR, OPT_BYTE);
+    if (retval != ERROR_OK)
+        return retval;
+    retval = target_write_u32(target, FMC_REG_BASE + FMC_REG_OCMR, FMC_CMD_PAGE_ERASE);
+    if (retval != ERROR_OK)
+        return retval;
+    retval = target_write_u32(target, FMC_REG_BASE + FMC_REG_OPCR, FMC_COMMIT);
+    if (retval != ERROR_OK)
+        return retval;
+    // wait
+    retval = ht32f165x_wait_status_busy(bank, FLASH_ERASE_TIMEOUT);
+    if (retval != ERROR_OK)
+        return retval;
+
+    // enable security protection
+    ob_cp = ~(1 | 0 << 1);
+    ob_ck = ob_cp;
+
+    // enable write protection
+    ob_pp[0] = 0x00000000;
+    ob_pp[1] = 0xffffffff;
+    ob_pp[2] = 0xffffffff;
+    ob_pp[3] = 0xffffffff;
+    ob_ck += ob_pp[0] + ob_pp[1] + ob_pp[2] + ob_pp[3];
+
+    // program option byte
+    for (int i = 0; i < 4; i++) {
+        retval = ht32f165x_program_word(bank, OPT_BYTE + (i << 2), ob_pp[i]);
+        if (retval != ERROR_OK)
+            break;
+    }
+    if (retval == ERROR_OK)
+        retval = ht32f165x_program_word(bank, OPT_BYTE + 0x10, ob_cp);
+    if (retval == ERROR_OK)
+        retval = ht32f165x_program_word(bank, OPT_BYTE + 0x20, ob_ck);
+
+    if (retval == ERROR_OK) {
+        // instruct user to do a system reset
+        LOG_INFO("ht32f165x Security will be set on reset");
+    } else {
+        LOG_ERROR("ht32f165x Failed to program option bytes");
+        return retval;
+    }
+
+    return ERROR_OK;
+}
+
+COMMAND_HANDLER(ht32f165x_handle_enable_security)
+{
+    if (CMD_ARGC < 1)
+        return ERROR_COMMAND_SYNTAX_ERROR;
+
+    struct flash_bank *bank;
+    int retval = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+    if (retval != ERROR_OK)
+        return retval;
+
+    retval = ht32f165x_protect(bank, 1, 0, 0);
+    if (retval == ERROR_OK) {
+        command_print(CMD, "ht32f165x enable security complete");
+    } else {
+        command_print(CMD, "ht32f165x enable security failed");
+    }
+
+    return retval;
 }
 
 static int ht32f165x_write(struct flash_bank *bank, const uint8_t *buffer,
@@ -167,6 +276,46 @@ static int ht32f165x_write(struct flash_bank *bank, const uint8_t *buffer,
     return ERROR_OK;
 }
 
+static int ht32f165x_security_check(struct flash_bank *bank)
+{
+    struct target *target = bank->target;
+    uint32_t security;
+    uint32_t ob_cp;
+    uint32_t ob_ck;
+    target_read_u32(target, FMC_REG_BASE + FMC_REG_CPSR, &security);
+    LOG_INFO("ht32f165x CPSR: 0x%04x", security);
+    target_read_u32(target, OPT_BYTE + 0x10, &ob_cp);
+    LOG_INFO("ht32f165x OB_CP: 0x%04x", ob_cp);
+    target_read_u32(target, OPT_BYTE + 0x20, &ob_ck);
+    LOG_INFO("ht32f165x OB_CK: 0x%04x", ob_ck);
+    return ERROR_OK;
+}
+
+static int ht32f165x_protect_check(struct flash_bank *bank)
+{
+    struct target *target = bank->target;
+    uint32_t ob_pp[4];
+    uint32_t ob_cp;
+
+    // Read page protection
+    for(int i = 0; i < 4; ++i)
+        target_read_u32(target, OPT_BYTE + (i << 2), ob_pp + i);
+    // Read protection config
+    target_read_u32(target, OPT_BYTE + 0x10, &ob_cp);
+
+    LOG_INFO("ht32f165x opt byte: %04x %04x %04x %04x %04x", ob_pp[0], ob_pp[1], ob_pp[2], ob_pp[3], ob_cp);
+
+    // Set page protection
+    for(int i = 0 ; i < 128; ++i){
+        size_t index = i / (sizeof(uint32_t) * 8);
+        size_t offset = i % (sizeof(uint32_t) * 8);
+        uint8_t is_protected = (ob_pp[index] & (1U << offset)) == 0;
+        bank->sectors[i].is_protected = is_protected;
+    }
+
+    return ERROR_OK;
+}
+
 static int ht32f165x_probe(struct flash_bank *bank)
 {
     int page_size = 1024;
@@ -188,6 +337,8 @@ static int ht32f165x_probe(struct flash_bank *bank)
         bank->sectors[i].is_protected = 1;
     }
 
+    ht32f165x_protect_check(bank);
+
     return ERROR_OK;
 }
 
@@ -196,35 +347,48 @@ static int ht32f165x_auto_probe(struct flash_bank *bank)
     return ht32f165x_probe(bank);
 }
 
-static int ht32f165x_protect_check(struct flash_bank *bank)
+static int ht32f165x_info(struct flash_bank *bank, struct command_invocation *cmd)
+{
+    ht32f165x_probe(bank);
+
+    const char *info = "ht32f165x flash";
+    command_print_sameline(cmd, "%s", info);
+    return ERROR_OK;
+}
+
+static int ht32f165x_check_security(struct flash_bank *bank)
 {
     struct target *target = bank->target;
-    uint32_t ob_pp[4];
-    uint32_t ob_cp;
 
-    // Read page protection
-    for(int i = 0; i < 4; ++i)
-        target_read_u32(target, OPT_BYTE + (i << 2), ob_pp + i);
-    // Read protection config
-    target_read_u32(target, OPT_BYTE + 0x10, &ob_cp);
-
-    LOG_INFO("ht32f165x opt byte: %04x %04x %04x %04x %04x", ob_pp[0], ob_pp[1], ob_pp[2], ob_pp[3], ob_cp);
-
-    // Set page protection
-    for(int i = 0 ; i < 128; ++i){
-        int bit = (ob_pp[i / 32] << (i % 32)) & 1;
-        bank->sectors[2*i].is_protected = bit ? 0 : 1;
-        bank->sectors[(2*i)+1].is_protected = bit ? 0 : 1;
+    if (target->state != TARGET_HALTED) {
+        LOG_ERROR("Target not halted");
+        return ERROR_TARGET_NOT_HALTED;
     }
+
+    ht32f165x_security_check(bank);
+    ht32f165x_protect_check(bank);
 
     return ERROR_OK;
 }
 
-static int ht32f165x_info(struct flash_bank *bank, struct command_invocation *cmd)
+COMMAND_HANDLER(ht32f165x_handle_check_security)
 {
-    const char *info = "ht32f165x flash";
-    command_print_sameline(cmd, "%s", info);
-    return ERROR_OK;
+    if (CMD_ARGC < 1)
+        return ERROR_COMMAND_SYNTAX_ERROR;
+
+    struct flash_bank *bank;
+    int retval = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+    if (retval != ERROR_OK)
+        return retval;
+
+    retval = ht32f165x_check_security(bank);
+    if (retval == ERROR_OK) {
+        command_print(CMD, "ht32f165x check_security complete");
+    } else {
+        command_print(CMD, "ht32f165x check_security failed");
+    }
+
+    return retval;
 }
 
 static int ht32f165x_mass_erase(struct flash_bank *bank)
@@ -320,6 +484,20 @@ static const struct command_registration ht32f165x_exec_command_handlers[] = {
         .mode = COMMAND_EXEC,
         .usage = "bank_id",
         .help = " test flash write",
+    },
+    {
+        .name = "check_security",
+        .handler = ht32f165x_handle_check_security,
+        .mode = COMMAND_EXEC,
+        .usage = "bank_id",
+        .help = " check flash security",
+    },
+    {
+        .name = "enable_security",
+        .handler = ht32f165x_handle_enable_security,
+        .mode = COMMAND_EXEC,
+        .usage = "bank_id",
+        .help = " enable flash security",
     },
     COMMAND_REGISTRATION_DONE
 };
